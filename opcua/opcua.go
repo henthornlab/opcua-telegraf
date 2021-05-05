@@ -3,53 +3,60 @@ package opcua
 import (
 	"context"
 	"log"
+	"math"
+	"time"
 
-	gopcua "github.com/gopcua/opcua"
+	"github.com/gopcua/opcua"
 	"github.com/gopcua/opcua/ua"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-// Structure for all the plugin info
+// OPCUA : Structure for all the plugin info
 type OPCUA struct {
-	ServerName string   `toml:"ServerName"`
-	URL        string   `toml:"URL"`
-	Nodes      []string `toml:"Nodes"`
+	ServerName string      `toml:"ServerName"`
+	URL        string      `toml:"URL"`
+	Nodes      []opcuaNode `toml:"Nodes"`
 	ctx        context.Context
-	client     *gopcua.Client
-	ID         *ua.NodeID
+	client     *opcua.Client
+	ID         []*ua.NodeID
+	ReadValID  []*ua.ReadValueID
 	req        *ua.ReadRequest
 }
 
-// Add this plugin to telegraf
+// Init : function to intialize the plugin
 func (o *OPCUA) Init() error {
 
-	var err error
 	o.ctx = context.Background()
+	// This version doesn't support certificates yet, only anonymous
+	o.client = opcua.NewClient(o.URL, opcua.SecurityMode(ua.MessageSecurityModeNone))
 
-	o.client = gopcua.NewClient(o.URL, gopcua.SecurityMode(ua.MessageSecurityModeNone))
-
-	log.Print("Starting opcua plugin to monitor:", o.URL)
-	for i := range o.Nodes {
-		log.Print(o.Nodes[i])
-	}
+	log.Print("opcua: Starting opcua plugin to monitor: ", o.URL)
 
 	if err := o.client.Connect(o.ctx); err != nil {
-		log.Print("Fatal error in client connect")
+		log.Print("opcua: Fatal error in client connect")
 		log.Fatal(err)
 	}
 
-	log.Print("Parsing nodeID")
-	o.ID, err = ua.ParseNodeID("ns=1;s=the.answer")
-	if err != nil {
-		log.Fatalf("invalid node id: %v", err)
+	for i := range o.Nodes {
+		tempID, err := ua.ParseNodeID(o.Nodes[i].NodeID)
+		if err != nil {
+			log.Fatalf("opcua: invalid node id: %v", err)
+		}
+		o.ID = append(o.ID, tempID)
+		o.ReadValID = append(o.ReadValID, &ua.ReadValueID{NodeID: tempID})
+
+		// Initialize info on the nodes for deviation and update interval checks
+		o.Nodes[i].currentValue = math.MaxFloat64
+		o.Nodes[i].lastUpdate = time.Now()
+
+		o.Nodes[i].maxTimeInterval, _ = time.ParseDuration(o.Nodes[i].AtLeastEvery)
+		//log.Print("Adding ", o.Nodes[i].NodeID, " with absolute deviation of ", o.Nodes[i].AbsDeviation, " at least every ", o.Nodes[i].maxTimeInterval)
 	}
 
-	log.Print("Building ReadRequest")
 	o.req = &ua.ReadRequest{
-		MaxAge: 2000,
-		NodesToRead: []*ua.ReadValueID{
-			&ua.ReadValueID{NodeID: o.ID}},
+		MaxAge:             2000,
+		NodesToRead:        o.ReadValID,
 		TimestampsToReturn: ua.TimestampsToReturnBoth,
 	}
 
@@ -64,30 +71,28 @@ func init() {
 // Gather implements the telegraf plugin interface method for data accumulation
 func (o *OPCUA) Gather(acc telegraf.Accumulator) error {
 
-	log.Print("In Gather() and attempting read")
-
 	resp, err := o.client.Read(o.req)
 
 	if err != nil {
-		log.Fatalf("Read failed: %s", err)
+		log.Fatalf("opcua: Read failed: %s", err)
 	}
-	if resp.Results[0].Status != ua.StatusOK {
-		log.Fatalf("Status not OK: %v", resp.Results[0].Status)
+
+	for i := range resp.Results {
+		if resp.Results[i].Status != ua.StatusOK {
+			log.Fatalf("opcua: Status not OK: %v on node %v", resp.Results[i].Status, o.Nodes[i].NodeID)
+		}
+
+		o.Nodes[i].UpdateValue(resp.Results[i])
+
+		if o.Nodes[i].NeedsUpdate() {
+			o.Nodes[i].sendMetrics(o.ServerName, acc)
+		}
 	}
-	log.Printf("%#v", resp.Results[0].Value.Value())
-
-	fields := make(map[string]interface{})
-	tags := make(map[string]string)
-
-	fields["ns1"] = resp.Results[0].Value.Value()
-	tags["server"] = o.ServerName
-
-	acc.AddFields("Answer", fields, tags)
 
 	return nil
 }
 
-const description = `Connect to OPC-UA Server`
+const description = `Monitor nodes on an OPC-UA Server`
 const sampleConfig = `
   ## OPC-UA Connection Configuration
   ##
@@ -95,14 +100,16 @@ const sampleConfig = `
   ## Currently supports anonymous mode only
   ##
   ## Name given to OPC UA server for logging and tags
-  name = "Device"
-  ## URL including endpoint
-  URL = "http://localhost.com:4840/endpoint"
-  ##
-  ## List of Nodes to monitor
-  ## List of Nodes to monitor
+  ServerName = "Device"
+  ## URL including endpoint. Only anonymous logins at this point
+  URL = "opc.tcp://localhost.com:4840/endpoint"
 
-  Nodes = ["ns=1;s=the.answer","ns=1;i=2345"]
+  ## List of Nodes to monitor including Tag (name), NodeID, and the absolute deviation (set to 0.0 to record all points)
+  ## AtLeastEvery forces an update on the point in Golang time, "10s", "30m", "24h", etc.
+  Nodes = [
+  {Tag = "HeatExchanger1 Temp", NodeID = "ns=2;s=TE-800-07/AI1/PV.CV", AbsDeviation = 0.10, AtLeastEvery = "30s"},
+  {Tag = "Heat Exchanger1 Pressure", NodeID = "ns=2;i=1234", AbsDeviation = 0.0, AtLeastEvery = "1h"},
+  ]
 `
 
 // SampleConfig returns a basic configuration for the plugin
@@ -116,6 +123,43 @@ func (o *OPCUA) Description() string {
 }
 
 type opcuaNode struct {
-	name   string `toml:"Name"`
-	nodeID string `toml:"NodeID"`
+	Tag                   string  `toml:"Tag"`
+	NodeID                string  `toml:"NodeID"`
+	AbsDeviation          float64 `toml:"AbsDeviation"`
+	AtLeastEvery          string  `toml:"AtLeastEvery"`
+	maxTimeInterval       time.Duration
+	lastUpdate            time.Time
+	currentValue          float64
+	previousValue         float64
+	currentValueTimeStamp time.Time
+}
+
+func (node *opcuaNode) UpdateValue(dataVal *ua.DataValue) {
+	node.previousValue = node.currentValue
+	node.currentValue = dataVal.Value.Float()
+	node.currentValueTimeStamp = dataVal.SourceTimestamp
+}
+
+func (node opcuaNode) NeedsUpdate() bool {
+
+	if (math.Abs(node.currentValue-node.previousValue) >= node.AbsDeviation) || (time.Now().Sub(node.lastUpdate) >= node.maxTimeInterval) {
+		return true
+	}
+	return false
+}
+
+func (node *opcuaNode) UpdateLastUpdate() {
+	node.lastUpdate = time.Now()
+}
+
+func (node *opcuaNode) sendMetrics(serverName string, acc telegraf.Accumulator) {
+	fields := make(map[string]interface{})
+	tags := make(map[string]string)
+
+	tags["server"] = serverName
+	tags["tag"] = node.Tag
+	tags["NodeID"] = node.NodeID
+	fields["value"] = node.currentValue
+	acc.AddFields("opcua", fields, tags, node.currentValueTimeStamp)
+	node.lastUpdate = time.Now()
 }
