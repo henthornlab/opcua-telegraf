@@ -50,15 +50,3 @@ func TestOpcua_NeedsUpdate(t *testing.T) {
 func TestOpc_sendMetrics(t *testing.T) {
 
 }
-© 2021 GitHub, Inc.
-Terms
-Privacy
-Security
-Status
-Docs
-Contact GitHub
-Pricing
-API
-Training
-Blog
-About
